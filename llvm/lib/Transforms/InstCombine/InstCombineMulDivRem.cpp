@@ -2448,6 +2448,15 @@ Instruction *InstCombinerImpl::visitURem(BinaryOperator &I) {
     return SelectInst::Create(Cmp, ConstantInt::getNullValue(Ty), FrozenOp0);
   }
 
+  // For "X % Op1" and if (X u< Op1) => X .
+  {
+    Value *Val =
+        simplifyICmpInst(ICmpInst::ICMP_ULT, Op0, Op1, SQ.getWithInstruction(&I));
+    if (Val && match(Val, m_One())) {
+      return Op0;
+    }
+  }
+
   // For "(X + 1) % Op1" and if (X u< Op1) => (X + 1) == Op1 ? 0 : X + 1 .
   if (match(Op0, m_Add(m_Value(X), m_One()))) {
     Value *Val =
