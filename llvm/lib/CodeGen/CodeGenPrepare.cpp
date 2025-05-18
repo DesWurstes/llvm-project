@@ -2050,8 +2050,8 @@ static bool foldFCmpToFPClassTest(CmpInst *Cmp, const TargetLowering &TLI,
 }
 
 static bool isRemOfLoopIncrementWithLoopInvariant(
-    Instruction *Rem, const LoopInfo *LI, Value *&RemAmtOut, Value *&AddInstOut,
-    Value *&AddOffsetOut, PHINode *&LoopIncrPNOut) {
+    Instruction *Rem, const LoopInfo *LI, Value *&IncAmtOut, Value *&RemAmtOut,
+    Value *&AddInstOut, Value *&AddOffsetOut, PHINode *&LoopIncrPNOut) {
   Value *Incr, *RemAmt;
   // NB: If RemAmt is a power of 2 it *should* have been transformed by now.
   if (!match(Rem, m_URem(m_Value(Incr), m_Value(RemAmt))))
@@ -2105,10 +2105,9 @@ static bool isRemOfLoopIncrementWithLoopInvariant(
   if (!LoopIncrInfo)
     return false;
 
-  // We need remainder_amount % increment_amount to be zero. Increment of one
-  // satisfies that without any special logic and is overwhelmingly the common
-  // case.
-  if (!match(LoopIncrInfo->second, m_One()))
+  // It simplifies the logic when remainder_amount % increment_amount would be zero.
+  Value *IncAmt = nullptr;
+  if (!match(LoopIncrInfo->second, m_Value(IncAmt)) || !IncAmt)
     return false;
 
   // Need the increment to not overflow.
@@ -2116,6 +2115,7 @@ static bool isRemOfLoopIncrementWithLoopInvariant(
     return false;
 
   // Set output variables.
+  IncAmtOut = IncAmt;
   RemAmtOut = RemAmt;
   LoopIncrPNOut = PN;
   AddInstOut = AddInst;
@@ -2127,10 +2127,16 @@ static bool isRemOfLoopIncrementWithLoopInvariant(
 // Try to transform:
 //
 // for(i = Start; i < End; ++i)
-//    Rem = (i nuw+ IncrLoopInvariant) u% RemAmtLoopInvariant;
+//    Rem = ((i * MultLoopInvariant) nuw+ IncrLoopInvariant) u%
+//    RemAmtLoopInvariant;
 //
 // ->
 //
+// Rem = (Start nuw+ IncrLoopInvariant) % RemAmtLoopInvariant;
+// for(i = Start; i < End; ++i, rem += MultLoopInvariant)
+//    Rem = rem >= RemAmtLoopInvariant ? rem - RemAmtLoopInvariant : Rem;
+//
+// but when MultLoopInvariant == 1:
 // Rem = (Start nuw+ IncrLoopInvariant) % RemAmtLoopInvariant;
 // for(i = Start; i < End; ++i, ++rem)
 //    Rem = rem == RemAmtLoopInvariant ? 0 : Rem;
@@ -2138,9 +2144,9 @@ static bool foldURemOfLoopIncrement(Instruction *Rem, const DataLayout *DL,
                                     const LoopInfo *LI,
                                     SmallSet<BasicBlock *, 32> &FreshBBs,
                                     bool IsHuge) {
-  Value *AddOffset, *RemAmt, *AddInst;
+  Value *AddOffset, *RemAmt, *AddInst, *IncAmt;
   PHINode *LoopIncrPN;
-  if (!isRemOfLoopIncrementWithLoopInvariant(Rem, LI, RemAmt, AddInst,
+  if (!isRemOfLoopIncrementWithLoopInvariant(Rem, LI, IncAmt, RemAmt, AddInst,
                                              AddOffset, LoopIncrPN))
     return false;
 
@@ -2181,6 +2187,13 @@ static bool foldURemOfLoopIncrement(Instruction *Rem, const DataLayout *DL,
   if (!Start)
     return false;
 
+  // If we can't fully optimize out the `inc`, skip this transform.
+  // TODO: Use ConstantFold??
+  ConstantInt *incCI = dyn_cast<ConstantInt>(IncAmt);
+  if (!incCI)
+    return false;
+  uint64_t inc = incCI->getZExtValue();
+
   // Create new remainder with induction variable.
   Type *Ty = Rem->getType();
   IRBuilder<> Builder(Rem->getContext());
@@ -2190,11 +2203,18 @@ static bool foldURemOfLoopIncrement(Instruction *Rem, const DataLayout *DL,
 
   Builder.SetInsertPoint(cast<Instruction>(
       LoopIncrPN->getIncomingValueForBlock(L->getLoopLatch())));
-  // `(add (urem x, y), 1)` is always nuw.
-  Value *RemAdd = Builder.CreateNUWAdd(NewRem, ConstantInt::get(Ty, 1));
-  Value *RemCmp = Builder.CreateICmp(ICmpInst::ICMP_EQ, RemAdd, RemAmt);
-  Value *RemSel =
-      Builder.CreateSelect(RemCmp, Constant::getNullValue(Ty), RemAdd);
+  // `(add (urem x, y), inc)` is always nuw.
+  Value *RemAdd = Builder.CreateNUWAdd(NewRem, ConstantInt::get(Ty, inc));
+  Value *RemSel;
+  if (inc == 1) {
+    Value *RemCmp = Builder.CreateICmp(ICmpInst::ICMP_EQ, RemAdd, RemAmt);
+    RemSel =
+        Builder.CreateSelect(RemCmp, Constant::getNullValue(Ty), RemAdd);
+  } else {
+    Value *RemCmp = Builder.CreateICmp(ICmpInst::ICMP_UGE, RemAdd, RemAmt);
+    Value *Sub = Builder.CreateSub(RemAdd, RemAmt);
+    RemSel = Builder.CreateSelect(RemCmp, Sub, RemAdd);
+  }
 
   NewRem->addIncoming(Start, L->getLoopPreheader());
   NewRem->addIncoming(RemSel, L->getLoopLatch());
